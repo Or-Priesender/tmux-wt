@@ -1,0 +1,5 @@
+*.bak
+.DS_Store
+
+# Session handoff notes, not part of the tool.
+HANDOFF.md

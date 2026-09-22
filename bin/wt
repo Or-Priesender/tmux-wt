@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# wt - Orca-style git worktree workspaces for tmux.
+set -euo pipefail
+
+WT_ROOT="${WT_ROOT:-$HOME/dev/worktrees}"
+WT_AGENT="${WT_AGENT:-claude}"
+WT_SCAN="${WT_SCAN:-$HOME/dev}"
+WT_PREFIX="${WT_PREFIX:-$(git config user.name 2>/dev/null | tr '[:upper:] ' '[:lower:]-')}"
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m%s\033[0m %s\n' "$1" "${2-}"; }
+
+main_repo() {
+  local common
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git repository"
+  dirname "$common"
+}
+
+base_ref() {
+  local b
+  git -C "$1" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null && return 0
+  for b in origin/main origin/master; do
+    if git -C "$1" rev-parse --verify --quiet "$b" >/dev/null; then echo "refs/remotes/$b"; return 0; fi
+  done
+  return 1
+}
+
+# Jira-keyed names stay verbatim so `git pr` picks the ticket out of the branch.
+branch_for() {
+  if [[ "$1" =~ ^[A-Z]+-[0-9]+ ]]; then echo "$1"; else echo "${WT_PREFIX:+$WT_PREFIX/}$1"; fi
+}
+
+session_for() { basename "$1" | tr '.:' '__'; }
+
+# Main checkouts only (worktrees live deeper than maxdepth 2), and only those
+# that actually have linked worktrees - git records them under .git/worktrees.
+all_repos() {
+  find "$WT_SCAN" -mindepth 2 -maxdepth 2 -name .git -type d 2>/dev/null |
+    while read -r g; do
+      # `if`, not `&&`: a trailing false test would make the loop exit non-zero,
+      # which pipefail propagates and set -e turns into a silent death.
+      if [ -n "$(ls -A "$g/worktrees" 2>/dev/null)" ]; then dirname "$g"; fi
+    done | sort
+}
+
+# Emits: repo<TAB>name<TAB>branch<TAB>changes<TAB>tmux<TAB>path
+rows_for() {
+  local repo=$1 sess p name br n win
+  sess=$(session_for "$repo")
+  git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | while read -r p; do
+    [ "$p" = "$repo" ] && continue
+    name=$(basename "$p")
+    br=$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+    n=$(git -C "$p" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if tmux list-windows -t "=$sess" -F '#{window_name}' 2>/dev/null | grep -Fxq "$name"; then win=live; else win=-; fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(basename "$repo")" "$name" "$br" "$n" "$win" "$p"
+  done
+}
+
+collect() {
+  if [ "${1:-}" = "--all" ]; then
+    local repo
+    while read -r repo; do rows_for "$repo"; done < <(all_repos)
+  else
+    rows_for "$(main_repo)"
+  fi
+}
+
+seed() {
+  local repo=$1 wt=$2 f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    mkdir -p "$wt/$(dirname "$f")"
+    cp -R "$repo/$f" "$wt/$f" && info "  seeded" "$f"
+  done < <(git -C "$repo" ls-files --others --ignored --exclude-standard | grep -E '(^|/)\.env' || true)
+
+  if [ -x "$repo/.worktree-setup" ]; then
+    info "  setup" ".worktree-setup"
+    ( cd "$wt" && MAIN_REPO="$repo" "$repo/.worktree-setup" )
+  fi
+}
+
+# Focus a worktree's window, creating the session/window if they are gone.
+focus() {
+  local path=$1 launch=${2:-0} repo sess name
+  repo=$(git -C "$path" worktree list --porcelain | awk 'NR==1{print $2}')
+  sess=$(session_for "$repo")
+  name=$(basename "$path")
+  tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$repo"
+  if ! tmux list-windows -t "=$sess" -F '#{window_name}' 2>/dev/null | grep -Fxq "$name"; then
+    tmux new-window -t "=$sess:" -n "$name" -c "$path"
+    tmux set-option -w -t "=$sess:$name" allow-rename off 2>/dev/null || true
+    tmux set-option -w -t "=$sess:$name" monitor-silence 45 2>/dev/null || true
+    if [ "$launch" = 1 ]; then tmux send-keys -t "=$sess:$name" "$WT_AGENT" Enter; fi
+  fi
+  tmux set-option -wu -t "=$sess:$name" @wt_attention 2>/dev/null || true
+  tmux set-option -wu -t "=$sess:$name" @wt_attention_at 2>/dev/null || true
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$sess:$name"; else tmux attach -t "=$sess:$name"; fi
+}
+
+# Windows an agent hook has flagged as finished or waiting for input.
+# Rows are "display<TAB>target<TAB>pane", oldest alert first.
+attention_rows() {
+  tmux list-windows -a -F '#{@wt_attention}	#{@wt_attention_at}	#{session_name}:#{window_index}	#{session_name} / #{window_name}	#{pane_id}' 2>/dev/null |
+    awk -F'\t' -v now="$(date +%s)" '
+      $1 == "" { next }
+      {
+        at = ($2 == "" ? now : $2); age = now - at
+        if (age < 60)        ago = age "s"
+        else if (age < 3600) ago = int(age / 60) "m"
+        else                 ago = int(age / 3600) "h"
+        printf "%s\t%-34s %-8s %6s ago\t%s\t%s\n", at, $4, $1, ago, $3, $5
+      }' | sort -n | cut -f2-
+}
+
+# `run-shell -b` (the cycle binding) discards stdout, so say it in tmux instead.
+say() {
+  if [ -n "${TMUX:-}" ]; then tmux display-message "wt: $*"; else info "wt" "$*"; fi
+}
+
+cmd_attention() {
+  local mode=${1:-} rows count sel target self
+  rows=$(attention_rows) || true
+  if [ -z "$rows" ]; then say "nothing waiting"; return 0; fi
+  count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+
+  # --auto is the keybinding entry point. It runs under `run-shell`, which has
+  # no tty, so it spends a popup only when there is a real choice to make and
+  # re-enters there for the picker (fzf needs that tty).
+  if [ "$mode" = "--auto" ] && [ "$count" -gt 1 ]; then
+    # The keybinding passes an absolute path, so $0 is normally already one.
+    self=$0
+    case $self in
+      /*) ;;
+      *) self=$(command -v "$self" 2>/dev/null || command -v wt 2>/dev/null || echo "$HOME/.local/bin/wt") ;;
+    esac
+    tmux display-popup -w 90% -h 70% -E "$self attention"
+    return 0
+  fi
+
+  if [ "$mode" = "--next" ] || [ "$count" = 1 ]; then
+    sel=$(printf '%s\n' "$rows" | head -1)
+    if [ "$mode" = "--next" ] && [ "$count" -gt 1 ]; then say "$((count - 1)) still waiting"; fi
+  else
+    command -v fzf >/dev/null || die "$count waiting; needs fzf to choose"
+    sel=$(printf '%s\n' "$rows" |
+      fzf --delimiter='\t' --with-nth=1 --height=100% --reverse \
+          --header="$count agents waiting on you" \
+          --preview='tmux capture-pane -p -t {3} 2>/dev/null | grep -v "^$" | tail -40' \
+          --preview-window=right,60%) || return 0
+  fi
+
+  target=$(printf '%s' "$sel" | cut -f2)
+  [ -n "$target" ] || die "could not resolve the selected window"
+  tmux set-option -wu -t "$target" @wt_attention 2>/dev/null || true
+  tmux set-option -wu -t "$target" @wt_attention_at 2>/dev/null || true
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$target"; else tmux attach -t "$target"; fi
+}
+
+# Placeholder name for work that has no ticket yet; rename later with `wt rename`.
+codename() {
+  local repo=$1 pool w
+  pool="lingcod marlin tarpon wrasse bonito grouper mackerel snapper halibut pollock
+        anchovy sardine herring barbel tetra dorado escolar opah wahoo cobia"
+  for w in $(printf '%s\n' $pool | sort -R); do
+    if [ ! -e "$WT_ROOT/$(basename "$repo")/$w" ]; then printf '%s' "$w"; return 0; fi
+  done
+  printf 'scratch-%s' "$(date +%H%M%S)"
+}
+
+# Sessions whose directory is a git repo, deduped by main worktree root.
+pick_repo() {
+  command -v fzf >/dev/null || die "interactive mode needs fzf"
+  local line
+  line=$(tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null |
+    while IFS=$'\t' read -r n p; do
+      if git -C "$p" rev-parse --git-dir >/dev/null 2>&1; then
+        root=$(git -C "$p" worktree list --porcelain 2>/dev/null | awk 'NR==1{print $2}')
+        if [ -n "$root" ]; then printf '%s\t%s\t%s\n' "$(basename "$root")" "$n" "$root"; fi
+      fi
+    done |
+    # Label by repo, not session: a session's cwd can point at another repo.
+    awk -F'\t' '!seen[$3]++ {printf "%-26s session: %s\t%s\n", $1, $2, $3}' | sort |
+    fzf --delimiter='\t' --with-nth=1 --height=100% --reverse \
+        --header='pick a session, then name the workspace' \
+        --preview='git -C {2} log --oneline -12 2>/dev/null' \
+        --preview-window=right,55%) || return 1
+  [ -n "$line" ] || return 1
+  printf '%s' "${line##*	}"
+}
+
+cmd_new() {
+  local name=${1:-} fetch=0 a repo
+  if [ -n "$name" ]; then
+    shift
+    repo=$(main_repo)
+  else
+    repo=$(pick_repo) || exit 0
+    printf 'workspace name for %s (empty for a codename): ' "$(basename "$repo")" > /dev/tty
+    IFS= read -r name < /dev/tty
+    [ -n "$name" ] || name=$(codename "$repo")
+  fi
+  for a in "$@"; do [ "$a" = "--fetch" ] && fetch=1; done
+
+  local wt branch base sess
+  wt="$WT_ROOT/$(basename "$repo")/$name"
+  branch=$(branch_for "$name")
+  [ -e "$wt" ] && die "worktree already exists: $wt"
+
+  if [ "$fetch" = 1 ]; then info "fetch" "origin"; git -C "$repo" fetch --quiet origin; fi
+  base=$(base_ref "$repo") || die "no origin/HEAD, main or master to branch from"
+
+  info "worktree" "$wt"
+  info "branch" "$branch  (from ${base#refs/remotes/})"
+  mkdir -p "$(dirname "$wt")"
+  if git -C "$repo" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+    git -C "$repo" worktree add "$wt" "$branch" >/dev/null
+  else
+    git -C "$repo" worktree add -b "$branch" "$wt" "$base" >/dev/null
+  fi
+  seed "$repo" "$wt"
+
+  command -v tmux >/dev/null || { info "ready" "$wt"; return; }
+  sess=$(session_for "$repo")
+  tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$repo"
+  tmux new-window -t "=$sess:" -n "$name" -c "$wt"
+  tmux set-option -w -t "=$sess:$name" allow-rename off 2>/dev/null || true
+  tmux set-option -w -t "=$sess:$name" monitor-silence 45 2>/dev/null || true
+  tmux send-keys -t "=$sess:$name" "$WT_AGENT" Enter
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$sess:$name"; else tmux attach -t "=$sess:$name"; fi
+}
+
+cmd_ls() {
+  local all=${1:-}
+  if [ "$all" = "--all" ]; then
+    printf '%-20s %-22s %-32s %-8s %s\n' REPO WORKSPACE BRANCH CHANGES TMUX
+    collect --all | while IFS=$'\t' read -r repo name br n win _; do
+      printf '%-20s %-22s %-32s %-8s %s\n' "$repo" "$name" "$br" "$n" "$win"
+    done
+  else
+    printf '%-22s %-34s %-9s %s\n' WORKSPACE BRANCH CHANGES TMUX
+    collect | while IFS=$'\t' read -r _ name br n win _; do
+      printf '%-22s %-34s %-9s %s\n' "$name" "$br" "$n" "$win"
+    done
+  fi
+}
+
+cmd_jump() {
+  command -v fzf >/dev/null || die "wt jump needs fzf"
+  local scope=${1:---all} rows sel path
+  rows=$(collect "$scope")
+  [ -n "$rows" ] || die "no worktrees found"
+  sel=$(printf '%s\n' "$rows" |
+    awk -F'\t' '{printf "%-18s %-22s %-30s %3s changes  %-5s\t%s\n", $1, $2, $3, $4, $5, $6}' |
+    fzf --delimiter='\t' --with-nth=1 --height=100% --reverse \
+        --header='enter: jump to workspace' \
+        --preview='git -C {2} status --short --branch 2>/dev/null | head -40' \
+        --preview-window=right,50%) || exit 0
+  path=${sel##*$'\t'}
+  [ -d "$path" ] || die "gone: $path"
+  focus "$path"
+}
+
+cmd_rename() {
+  local old=${1:-} new=${2:-}
+  [ -n "$old" ] && [ -n "$new" ] || die "usage: wt rename <old> <new>"
+  local repo base oldpath newpath oldbranch newbranch sess
+  repo=$(main_repo); base=$(basename "$repo")
+  oldpath="$WT_ROOT/$base/$old"
+  newpath="$WT_ROOT/$base/$new"
+  [ -d "$oldpath" ] || die "no such worktree: $oldpath"
+  [ -e "$newpath" ] && die "already exists: $newpath"
+  oldbranch=$(git -C "$oldpath" rev-parse --abbrev-ref HEAD)
+  newbranch=$(branch_for "$new")
+  sess=$(session_for "$repo")
+
+  git -C "$repo" worktree move "$oldpath" "$newpath"
+  info "moved" "$oldpath -> $newpath"
+  if [ "$oldbranch" != "$newbranch" ]; then
+    git -C "$repo" branch -m "$oldbranch" "$newbranch"
+    info "branch" "$oldbranch -> $newbranch"
+  fi
+  if tmux rename-window -t "=$sess:$old" "$new" 2>/dev/null; then info "window" "$old -> $new"; fi
+  if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$oldbranch" >/dev/null; then
+    printf '\033[33mnote:\033[0m origin/%s still exists; push %s and delete the old remote branch\n' \
+      "$oldbranch" "$newbranch"
+  fi
+  printf '\033[33mnote:\033[0m shells already in that worktree follow the move, but their prompt\n'
+  printf '      shows the old path until you run: cd .\n'
+}
+
+cmd_rm() {
+  local name=${1:-}
+  [ -n "$name" ] || die "usage: wt rm <name>"
+  local repo wt branch sess base ans
+  repo=$(main_repo)
+  wt="$WT_ROOT/$(basename "$repo")/$name"
+  [ -d "$wt" ] || die "no such worktree: $wt"
+  branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD)
+
+  if [ -n "$(git -C "$wt" status --porcelain)" ]; then
+    read -rp "$name has uncommitted changes. Remove anyway? [y/N] " ans
+    [ "$ans" = y ] || exit 1
+  fi
+  sess=$(session_for "$repo")
+  tmux kill-window -t "=$sess:$name" 2>/dev/null || true
+  git -C "$repo" worktree remove --force "$wt"
+  info "removed" "$wt"
+  base=$(base_ref "$repo") || return 0
+  if git -C "$repo" branch --merged "$base" | grep -qE "^[ *+]+${branch}$"; then
+    git -C "$repo" branch -d "$branch" && info "deleted" "branch $branch"
+  else
+    info "kept" "branch $branch (unmerged)"
+  fi
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  ls|list) shift; cmd_ls "${1:-}" ;;
+  jump|j) shift; cmd_jump "${1:---all}" ;;
+  attention|att) shift; cmd_attention "${1:-}" ;;
+  rename|mv) shift; cmd_rename "$@" ;;
+  rm|remove) shift; cmd_rm "$@" ;;
+  *) cat >&2 <<USAGE
+wt - Orca-style worktree workspaces for tmux
+
+  wt new <name> [--fetch]   create worktree + branch, seed it, open a tmux window running the agent
+  wt ls [--all]             list workspaces in this repo, or across every repo under \$WT_SCAN
+  wt jump [--all]           fuzzy-pick a workspace and switch to its tmux window
+  wt attention [--next]     pick an agent that finished or needs input (--next: oldest, no picker)
+  wt rename <old> <new>     rename a codename workspace once you have a ticket
+  wt rm <name>              kill the window, remove the worktree, delete the branch if merged
+
+env: WT_ROOT=$WT_ROOT
+     WT_SCAN=$WT_SCAN
+     WT_AGENT=$WT_AGENT
+     WT_PREFIX=$WT_PREFIX
+USAGE
+    exit 1 ;;
+esac

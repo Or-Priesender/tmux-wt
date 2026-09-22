@@ -1,0 +1,18 @@
+# tmux-wt: worktree workspaces for tmux.
+# Generated from tmux/wt.conf.in -- edit that file, not this block.
+
+bind @WT_KEY_NEW@ display-popup -d '#{pane_current_path}' -w 90% -h 70% -E "@WT_BIN@ new"
+bind @WT_KEY_JUMP@ display-popup -d '#{pane_current_path}' -w 90% -h 70% -E "@WT_BIN@ jump"
+
+# Agent windows flag themselves when they go quiet (wt sets monitor-silence).
+setw -g monitor-bell on
+set -g visual-bell off
+setw -g window-status-activity-style 'fg=colour235,bg=colour179,bold'
+setw -g window-status-bell-style 'fg=colour235,bg=colour208,bold'
+
+# Jump to an agent that finished or needs input (flagged by the agent hook).
+bind @WT_KEY_ATTENTION@ run-shell -b "@WT_BIN@ attention --auto"
+setw -g window-status-format '#I:#W#{?@wt_attention,!,}#F'
+setw -g window-status-current-format '#I:#W#{?@wt_attention,!,}#F'
+# Cycle straight to the longest-waiting agent, no picker.
+bind @WT_KEY_NEXT@ run-shell -b "@WT_BIN@ attention --next"
