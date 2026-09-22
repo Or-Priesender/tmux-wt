@@ -83,6 +83,11 @@ git -C "$D" remote set-head origin -a >/dev/null
 echo 'SECRET=sandbox' > "$D/.env"
 ok "repo with origin/HEAD -> $(git -C "$D" symbolic-ref refs/remotes/origin/HEAD)"
 
+# A second checkout that deliberately never gets a tmux session, so the picker
+# has to find it by scanning $WT_SCAN.
+git clone -q "$SBX/origin.git" "$SBX/dev/lonely" 2>/dev/null
+ok "second repo with no tmux session"
+
 mkdir -p "$SBX/shim" "$SBX/out"
 cat > "$SBX/shim/tmux" <<EOF
 #!/bin/sh
@@ -206,6 +211,23 @@ git -C "$SBX/worktrees/demo/beta" commit -qm work
 is "removed" "$(run 'echo y | wt rm beta')" "0"
 is "unmerged branch kept" \
    "$(git -C "$D" branch --list tester/beta | wc -l | tr -d ' ')" "1"
+
+head_ "wt new with no name (the prefix + a path)"
+# The picker needs a tty, so it runs in the pane like everything else. fzf's
+# --filter makes it non-interactive: it prints the matching line and exits,
+# which is enough to drive pick_repo without a human.
+is "no tmux session for the second repo yet" \
+   "$(itmux list-sessions -F '#{session_name}' | grep -cx lonely)" "0"
+rm -f "$SBX/out/rc"
+itmux send-keys -t '=demo:host' \
+  "FZF_DEFAULT_OPTS='--filter=lonely' wt new > $SBX/out/log 2>&1; echo \$? > $SBX/out/rc" Enter
+sleep 2
+itmux send-keys -t '=demo:host' "scanned" Enter   # answers the name prompt
+i=0; while [ ! -f "$SBX/out/rc" ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i+1)); done
+is "exit status" "$(cat "$SBX/out/rc" 2>/dev/null || echo timeout)" "0"
+has "reached a repo that had no session" "$SBX/worktrees/lonely/scanned"
+is "created its session" "$(itmux list-sessions -F '#{session_name}' | grep -cx lonely)" "1"
+is "and its window"      "$(itmux list-windows -t '=lonely' -F '#{window_name}' | grep -cx scanned)" "1"
 
 # ------------------------------------------------------------------ config ---
 head_ "tmux config block"

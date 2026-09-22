@@ -32,15 +32,22 @@ branch_for() {
 
 session_for() { basename "$1" | tr '.:' '__'; }
 
-# Main checkouts only (worktrees live deeper than maxdepth 2), and only those
-# that actually have linked worktrees - git records them under .git/worktrees.
-all_repos() {
+# Main checkouts one level under $WT_SCAN. In a main checkout .git is a
+# directory; in a linked worktree it is a file, which keeps worktrees out.
+scan_repos() {
   find "$WT_SCAN" -mindepth 2 -maxdepth 2 -name .git -type d 2>/dev/null |
-    while read -r g; do
+    while read -r g; do dirname "$g"; done | sort
+}
+
+# Of those, the ones that actually have linked worktrees - git records them
+# under .git/worktrees.
+all_repos() {
+  scan_repos |
+    while read -r r; do
       # `if`, not `&&`: a trailing false test would make the loop exit non-zero,
       # which pipefail propagates and set -e turns into a silent death.
-      if [ -n "$(ls -A "$g/worktrees" 2>/dev/null)" ]; then dirname "$g"; fi
-    done | sort
+      if [ -n "$(ls -A "$r/.git/worktrees" 2>/dev/null)" ]; then echo "$r"; fi
+    done
 }
 
 # Emits: repo<TAB>name<TAB>branch<TAB>changes<TAB>tmux<TAB>path
@@ -168,21 +175,34 @@ codename() {
   printf 'scratch-%s' "$(date +%H%M%S)"
 }
 
-# Sessions whose directory is a git repo, deduped by main worktree root.
-pick_repo() {
-  command -v fzf >/dev/null || die "interactive mode needs fzf"
-  local line
-  line=$(tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null |
+# Candidate repos to open a workspace in: the ones you already have a tmux
+# session for, then every other main checkout under $WT_SCAN. Sessions come
+# first so the dedupe below keeps their label, and so that a repo you are
+# already working in sorts with its session name attached.
+# Emits: repo<TAB>label<TAB>root
+repo_candidates() {
+  tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null |
     while IFS=$'\t' read -r n p; do
       if git -C "$p" rev-parse --git-dir >/dev/null 2>&1; then
         root=$(git -C "$p" worktree list --porcelain 2>/dev/null | awk 'NR==1{print $2}')
-        if [ -n "$root" ]; then printf '%s\t%s\t%s\n' "$(basename "$root")" "$n" "$root"; fi
+        if [ -n "$root" ]; then printf '%s\t%s\t%s\n' "$(basename "$root")" "session: $n" "$root"; fi
       fi
-    done |
-    # Label by repo, not session: a session's cwd can point at another repo.
-    awk -F'\t' '!seen[$3]++ {printf "%-26s session: %s\t%s\n", $1, $2, $3}' | sort |
+    done
+  scan_repos |
+    while read -r root; do
+      printf '%s\t%s\t%s\n' "$(basename "$root")" "no session" "$root"
+    done
+}
+
+pick_repo() {
+  command -v fzf >/dev/null || die "interactive mode needs fzf"
+  local line
+  line=$(repo_candidates |
+    # Dedupe by main worktree root, not by session: a session's cwd can point
+    # at another repo, and a repo can have several sessions.
+    awk -F'\t' '!seen[$3]++ {printf "%-26s %-22s\t%s\n", $1, $2, $3}' | sort |
     fzf --delimiter='\t' --with-nth=1 --height=100% --reverse \
-        --header='pick a session, then name the workspace' \
+        --header='pick a repo, then name the workspace' \
         --preview='git -C {2} log --oneline -12 2>/dev/null' \
         --preview-window=right,55%) || return 1
   [ -n "$line" ] || return 1

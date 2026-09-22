@@ -117,7 +117,7 @@ your own format, add `#{?@wt_attention,!,}` to it yourself and drop the two
 | Command | What it does |
 |---|---|
 | `wt new <name> [--fetch]` | Create the worktree and branch, seed it, open a tmux window, start the agent. `--fetch` updates `origin` first. |
-| `wt new` | fzf-pick one of your tmux sessions that is a git repo, then prompt for a name. An empty name gets a fish codename. |
+| `wt new` | fzf-pick a repo, then prompt for a name. An empty name gets a fish codename. |
 | `wt ls [--all]` | List workspaces in this repo, or across every repo under `$WT_SCAN`. |
 | `wt jump [--all]` | fzf-pick a workspace and switch to its tmux window, recreating the window if it was closed. |
 | `wt attention [--next]` | Go to an agent that finished or is waiting. `--next` takes the longest-waiting one with no picker. |
@@ -135,6 +135,22 @@ your own format, add `#{?@wt_attention,!,}` to it yourself and drop the two
    the worktree as cwd and `$MAIN_REPO` pointing at the main checkout. Use it for
    `npm install`, symlinking a `node_modules`, whatever the repo needs.
 5. Opens a tmux window named after the workspace and starts `$WT_AGENT` in it.
+
+### Which repos `wt new` offers
+
+With no arguments (which is what `prefix + a` runs) the picker lists the repos
+you already have a tmux session for, labelled with that session, followed by
+every other main checkout one level under `$WT_SCAN`, labelled `no session`. A
+repo is listed once, deduped by its main worktree root, since a repo can have
+several sessions and a session's cwd can point at a different repo.
+
+That means a session manager like [tms](https://github.com/jrmoulton/tmux-sessionizer)
+composes with this but is not required: sessions you already have float to a
+useful label, and repos you have never opened are still reachable. Picking
+either one creates the session if it does not exist.
+
+Giving a name instead (`wt new my-task`) skips the picker entirely and uses the
+repo you are currently in.
 
 ### Branch naming
 
@@ -222,7 +238,7 @@ Add whatever your own tools set (`$ORCA_PANE_KEY`, `$TERM_PROGRAM`), and use
 ## Tests
 
 ```sh
-./test/smoke.sh          # 54 assertions across all six subcommands
+./test/smoke.sh          # 60 assertions across all six subcommands
 ./test/smoke.sh --keep   # leave the sandbox up to poke at
 ```
 
