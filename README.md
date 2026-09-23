@@ -101,6 +101,7 @@ set -g @wt-key-new 'w'
 set -g @wt-key-jump 'W'
 set -g @wt-key-attention 'e'
 set -g @wt-key-next 'E'
+set -g @wt-key-rm 'R'
 ```
 
 ### A note on your status bar
@@ -122,7 +123,7 @@ your own format, add `#{?@wt_attention,!,}` to it yourself and drop the two
 | `wt jump [--all]` | fzf-pick a workspace and switch to its tmux window, recreating the window if it was closed. |
 | `wt attention [--next]` | Go to an agent that finished or is waiting. `--next` takes the longest-waiting one with no picker. |
 | `wt rename <old> <new>` | Rename the workspace, the branch and the tmux window together. |
-| `wt rm <name>` | Kill the window, remove the worktree, delete the branch if it is merged. |
+| `wt rm <name>` | Kill the window, remove the worktree, delete the branch if it is merged. `prefix + Q` does this for the current window, after a confirmation. |
 
 ### What `wt new` actually does
 

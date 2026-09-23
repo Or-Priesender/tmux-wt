@@ -20,7 +20,8 @@ conf=$(bash "$PLUGIN_DIR/tmux/render.sh" \
   "$(opt @wt-key-new a)" \
   "$(opt @wt-key-jump A)" \
   "$(opt @wt-key-attention n)" \
-  "$(opt @wt-key-next N)")
+  "$(opt @wt-key-next N)" \
+  "$(opt @wt-key-rm Q)")
 
 tmpf=$(mktemp -t wt.tmux) || exit 0
 printf '%s\n' "$conf" > "$tmpf"

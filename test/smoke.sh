@@ -238,7 +238,7 @@ if itmux source-file "$tf" 2>"$SBX/out/src.err"; then ok "tmux accepts the block
 else no "tmux rejects the block: $(cat "$SBX/out/src.err")"; fi
 # send-keys cannot fire a binding, so assert what the key is bound to instead.
 binds=$(itmux list-keys -T prefix)
-for k in 'a .*wt new' 'A .*wt jump' 'n .*attention --auto' 'N .*attention --next'; do
+for k in 'a .*wt new' 'A .*wt jump' 'n .*attention --auto' 'N .*attention --next' 'Q .*wt rm'; do
   key=${k%% *}
   if printf '%s' "$binds" | grep -qE "bind-key +-T prefix +$k"; then
     ok "prefix + $key is bound"
